@@ -1,0 +1,126 @@
+name: Update Shoin mirror
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: '23 * * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: read
+    outputs:
+      changed: ${{ steps.source.outputs.changed }}
+      source_commit: ${{ steps.source.outputs.source_commit }}
+      deployment_month: ${{ steps.source.outputs.deployment_month }}
+    steps:
+      - name: Check out mirror configuration
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: mirror
+          persist-credentials: false
+      - name: Read the original project's latest source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ludwigpeking/Shoin_zukuri_WFC
+          ref: main
+          path: source
+          persist-credentials: false
+      - name: Check whether a deployment is needed
+        id: source
+        env:
+          TRIGGER_EVENT: ${{ github.event_name }}
+        run: |
+          source_commit=$(git -C source rev-parse HEAD)
+          deployment_month=$(date -u +%Y-%m)
+          printf '%s\n%s\n' "$source_commit" "$deployment_month" > expected-state.txt
+          echo "source_commit=$source_commit" >> "$GITHUB_OUTPUT"
+          echo "deployment_month=$deployment_month" >> "$GITHUB_OUTPUT"
+          if [ "$TRIGGER_EVENT" != schedule ] || ! cmp -s expected-state.txt mirror/deployed-state.txt; then
+            echo 'changed=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Set up Node.js
+        if: steps.source.outputs.changed == 'true'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: source/package-lock.json
+      - name: Read mirror Pages configuration
+        if: steps.source.outputs.changed == 'true'
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6
+      - name: Install dependencies
+        if: steps.source.outputs.changed == 'true'
+        working-directory: source
+        run: npm ci
+      - name: Build for the mirror address
+        if: steps.source.outputs.changed == 'true'
+        working-directory: source
+        env:
+          MIRROR_REPOSITORY_NAME: ${{ github.event.repository.name }}
+        run: npm run build -- --base "/$MIRROR_REPOSITORY_NAME/"
+      - name: Require an independent GitHub Pages address
+        if: steps.source.outputs.changed == 'true'
+        run: |
+          if [ -e source/dist/CNAME ]; then
+            echo 'A CNAME file would redirect this mirror. Remove it from the build before publishing.' >&2
+            exit 1
+          fi
+      - name: Upload mirror site
+        if: steps.source.outputs.changed == 'true'
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
+        with:
+          path: source/dist
+
+  deploy:
+    needs: build
+    if: needs.build.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Publish mirror
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5
+
+  record:
+    needs: [build, deploy]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out mirror configuration
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: main
+      - name: Record successful deployment
+        env:
+          SOURCE_COMMIT: ${{ needs.build.outputs.source_commit }}
+          DEPLOYMENT_MONTH: ${{ needs.build.outputs.deployment_month }}
+        run: |
+          printf '%s\n%s\n' "$SOURCE_COMMIT" "$DEPLOYMENT_MONTH" > deployed-state.txt
+          git add deployed-state.txt
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m "Record Shoin mirror deployment $SOURCE_COMMIT"
+          git push origin HEAD:main
